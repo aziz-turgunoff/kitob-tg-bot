@@ -42,41 +42,15 @@ logger = logging.getLogger(__name__)
 # Database setup
 def init_database():
     """Initialize SQLite database for storing posts"""
-    conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-    # Enable proper datetime handling for Python 3.12+
-    conn.execute("PRAGMA foreign_keys = ON")
-    cursor = conn.cursor()
-    
-    # First, create the posts table if it doesn't exist
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message_id INTEGER,
-            channel_message_id INTEGER,
-            text_content TEXT,
-            image_path TEXT,
-            file_ids TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            repost_count INTEGER DEFAULT 0,
-            last_repost TIMESTAMP
-        )
-    ''')
-    
-    # Now check if file_ids column exists, if not add it
-    cursor.execute("PRAGMA table_info(posts)")
-    columns = [column[1] for column in cursor.fetchall()]
-    
-    if 'file_ids' not in columns:
-        # Add file_ids column for new file_id based storage
-        cursor.execute('ALTER TABLE posts ADD COLUMN file_ids TEXT')
-        logger.info("Added file_ids column to posts table")
-    
-    # Check if is_sold column exists, if it does remove it
-    if 'is_sold' in columns:
-        # SQLite doesn't support DROP COLUMN directly, so we need to recreate the table
+    try:
+        conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
+        # Enable proper datetime handling for Python 3.12+
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        
+        # First, create the posts table if it doesn't exist
         cursor.execute('''
-            CREATE TABLE posts_new (
+            CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 message_id INTEGER,
@@ -90,28 +64,64 @@ def init_database():
             )
         ''')
         
-        # Copy data from old table to new table (excluding is_sold column)
+        # Now check if file_ids column exists, if not add it
+        try:
+            cursor.execute("PRAGMA table_info(posts)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            if 'file_ids' not in columns:
+                # Add file_ids column for new file_id based storage
+                cursor.execute('ALTER TABLE posts ADD COLUMN file_ids TEXT')
+                logger.info("Added file_ids column to posts table")
+            
+            # Check if is_sold column exists, if it does remove it
+            if 'is_sold' in columns:
+                # SQLite doesn't support DROP COLUMN directly, so we need to recreate the table
+                cursor.execute('''
+                    CREATE TABLE posts_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        message_id INTEGER,
+                        channel_message_id INTEGER,
+                        text_content TEXT,
+                        image_path TEXT,
+                        file_ids TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        repost_count INTEGER DEFAULT 0,
+                        last_repost TIMESTAMP
+                    )
+                ''')
+                
+                # Copy data from old table to new table (excluding is_sold column)
+                cursor.execute('''
+                    INSERT INTO posts_new (id, user_id, message_id, channel_message_id, text_content, image_path, file_ids, created_at, repost_count, last_repost)
+                    SELECT id, user_id, message_id, channel_message_id, text_content, image_path, file_ids, created_at, repost_count, last_repost
+                    FROM posts
+                ''')
+                
+                # Drop old table and rename new table
+                cursor.execute('DROP TABLE posts')
+                cursor.execute('ALTER TABLE posts_new RENAME TO posts')
+                logger.info("Removed is_sold column from posts table")
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Database schema update warning: {e}")
+            # Continue anyway, the table was created
+        
         cursor.execute('''
-            INSERT INTO posts_new (id, user_id, message_id, channel_message_id, text_content, image_path, file_ids, created_at, repost_count, last_repost)
-            SELECT id, user_id, message_id, channel_message_id, text_content, image_path, file_ids, created_at, repost_count, last_repost
-            FROM posts
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         ''')
         
-        # Drop old table and rename new table
-        cursor.execute('DROP TABLE posts')
-        cursor.execute('ALTER TABLE posts_new RENAME TO posts')
-        logger.info("Removed is_sold column from posts table")
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully")
+        
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+        raise
 
 class BookBot:
     def __init__(self, bot_token: str, channel_id: str, admin_ids: List[int] = None):
