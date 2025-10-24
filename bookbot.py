@@ -47,7 +47,23 @@ def init_database():
     conn.execute("PRAGMA foreign_keys = ON")
     cursor = conn.cursor()
     
-    # Check if file_ids column exists, if not add it
+    # First, create the posts table if it doesn't exist
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            message_id INTEGER,
+            channel_message_id INTEGER,
+            text_content TEXT,
+            image_path TEXT,
+            file_ids TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            repost_count INTEGER DEFAULT 0,
+            last_repost TIMESTAMP
+        )
+    ''')
+    
+    # Now check if file_ids column exists, if not add it
     cursor.execute("PRAGMA table_info(posts)")
     columns = [column[1] for column in cursor.fetchall()]
     
@@ -85,21 +101,6 @@ def init_database():
         cursor.execute('DROP TABLE posts')
         cursor.execute('ALTER TABLE posts_new RENAME TO posts')
         logger.info("Removed is_sold column from posts table")
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message_id INTEGER,
-            channel_message_id INTEGER,
-            text_content TEXT,
-            image_path TEXT,
-            file_ids TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            repost_count INTEGER DEFAULT 0,
-            last_repost TIMESTAMP
-        )
-    ''')
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS admins (
