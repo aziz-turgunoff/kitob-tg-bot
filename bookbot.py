@@ -8,6 +8,7 @@ from typing import List, Optional
 import re
 import hashlib
 from dotenv import load_dotenv
+from database import db
 
 # Fix SQLite datetime deprecation warning for Python 3.12+
 def adapt_datetime_iso(val):
@@ -64,46 +65,8 @@ logger = logging.getLogger(__name__)
 
 # Database setup
 def init_database():
-    """Initialize SQLite database for storing posts"""
-    conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-    conn.execute("PRAGMA foreign_keys = ON")
-    cursor = conn.cursor()
-    
-    # Create posts table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message_id INTEGER,
-            channel_message_id INTEGER,
-            channel_message_ids TEXT,
-            text_content TEXT,
-            image_path TEXT,
-            file_ids TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            repost_count INTEGER DEFAULT 0,
-            last_repost TIMESTAMP
-        )
-    ''')
-    
-    # Add channel_message_ids column if it doesn't exist (for backward compatibility)
-    try:
-        cursor.execute('ALTER TABLE posts ADD COLUMN channel_message_ids TEXT')
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    
-    # Create admins table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized successfully")
+    """Initialize database (SQLite or PostgreSQL)"""
+    db.init_database()
 
 class BookBot:
     def __init__(self, bot_token: str, channel_id: str, admin_ids: List[int] = None, repost_interval_days: int = 7):
@@ -209,35 +172,23 @@ Narx
             return True
             
         # Check database
-        conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM admins WHERE user_id = ?', (user_id,))
-        result = cursor.fetchone()
-        conn.close()
-        
+        result = db.execute_fetchone('SELECT user_id FROM admins WHERE user_id = ?', (user_id,))
         return result is not None
         
     def add_admin_to_db(self, user_id: int, username: str = None):
         """Add admin to database"""
-        conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-        cursor = conn.cursor()
-        cursor.execute('''
+        db.execute('''
             INSERT OR REPLACE INTO admins (user_id, username) 
             VALUES (?, ?)
         ''', (user_id, username))
-        conn.commit()
-        conn.close()
         
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
         try:
             # Get database stats
-            conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-            cursor = conn.cursor()
-            
             # Total posts
-            cursor.execute('SELECT COUNT(*) FROM posts')
-            total_posts = cursor.fetchone()[0]
+            result = db.execute_fetchone('SELECT COUNT(*) FROM posts')
+            total_posts = result[0] if result else 0
             
             # Total active posts
             active_posts = total_posts
@@ -245,14 +196,12 @@ Narx
             # Posts needing repost
             interval_ago = datetime.now() - timedelta(days=self.repost_interval_days)
             interval_ago_str = interval_ago.strftime('%Y-%m-%d %H:%M:%S')
-            cursor.execute('''
+            result = db.execute_fetchone('''
                 SELECT COUNT(*) FROM posts 
                 WHERE julianday(created_at) <= julianday(?) 
                 AND (last_repost IS NULL OR julianday(last_repost) <= julianday(?))
             ''', (interval_ago_str, interval_ago_str))
-            repost_needed = cursor.fetchone()[0]
-            
-            conn.close()
+            repost_needed = result[0] if result else 0
             
             status_text = f"""📊 **Bot Status**
 
@@ -761,51 +710,42 @@ Narx
             
     def update_channel_message_id(self, post_id: int, channel_message_id: int, all_message_ids: list = None):
         """Update channel message ID(s) in database"""
-        conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-        cursor = conn.cursor()
-        
         # Store all message IDs as JSON for media groups
         if all_message_ids:
             message_ids_json = json.dumps(all_message_ids)
-            cursor.execute('''
+            db.execute('''
                 UPDATE posts 
                 SET channel_message_id = ?, channel_message_ids = ? 
                 WHERE id = ?
             ''', (channel_message_id, message_ids_json, post_id))
         else:
             # Backward compatibility: if no list provided, just store single ID
-            cursor.execute('UPDATE posts SET channel_message_id = ? WHERE id = ?', (channel_message_id, post_id))
-        
-        conn.commit()
-        conn.close()
+            db.execute('UPDATE posts SET channel_message_id = ? WHERE id = ?', (channel_message_id, post_id))
             
     def save_post(self, user_id: int, message_id: int, channel_message_id: int, 
                   text_content: str, file_ids: list):
         """Save post to database"""
-        conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-        cursor = conn.cursor()
-        
         # Convert file_ids list to JSON string for storage
         file_ids_json = json.dumps(file_ids)
         
-        cursor.execute('''
-            INSERT INTO posts (user_id, message_id, channel_message_id, text_content, file_ids)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, message_id, channel_message_id, text_content, file_ids_json))
+        def execute_insert(cursor, conn):
+            cursor.execute('''
+                INSERT INTO posts (user_id, message_id, channel_message_id, text_content, file_ids)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, message_id, channel_message_id, text_content, file_ids_json))
+            # Get the last inserted ID (works for both SQLite and PostgreSQL)
+            if db.db_type == 'postgresql':
+                cursor.execute('SELECT LASTVAL()')
+                post_id = cursor.fetchone()[0]
+            else:
+                post_id = cursor.lastrowid
+            return post_id
         
-        post_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        return post_id
+        return db.execute_with_cursor(execute_insert)
         
     async def check_and_repost(self, context: ContextTypes.DEFAULT_TYPE):
         """Check for posts that need reposting"""
-        conn = None
         try:
-            conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-            cursor = conn.cursor()
-            
             # Get posts that are older than repost_interval_days and need reposting
             # Logic: Repost if:
             # 1. Post was created more than repost_interval_days ago AND has never been reposted (last_repost IS NULL)
@@ -815,7 +755,7 @@ Narx
             
             # Improved query: Check if created_at is old enough, and either never reposted or last repost is old enough
             # Use julianday() for more reliable date comparisons in SQLite
-            cursor.execute('''
+            posts = db.execute_fetchall('''
                 SELECT id, channel_message_id, channel_message_ids, text_content, image_path, file_ids, repost_count, 
                        created_at, last_repost
                 FROM posts 
@@ -825,8 +765,6 @@ Narx
                     OR julianday(last_repost) <= julianday(?)
                 )
             ''', (interval_ago_str, interval_ago_str))
-            
-            posts = cursor.fetchall()
             logger.info(f"Repost check: Found {len(posts)} posts that need reposting (older than {self.repost_interval_days} days)")
             
             # Log details for debugging
@@ -901,7 +839,7 @@ Narx
                             # Media group: store all message IDs
                             new_message_ids = [msg.message_id for msg in new_message]
                             new_message_ids_json = json.dumps(new_message_ids)
-                            cursor.execute('''
+                            db.execute('''
                                 UPDATE posts 
                                 SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
                                 WHERE id = ?
@@ -909,7 +847,7 @@ Narx
                         else:
                             # Single message
                             single_id_json = json.dumps([new_message.message_id])
-                            cursor.execute('''
+                            db.execute('''
                                 UPDATE posts 
                                 SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
                                 WHERE id = ?
@@ -922,14 +860,9 @@ Narx
                 except Exception as e:
                     logger.error(f"Repost error for post {post_id}: {e}", exc_info=True)
             
-            if conn:
-                conn.commit()
             logger.info(f"Repost check completed. Processed {len(posts)} posts.")
         except Exception as e:
             logger.error(f"Error in check_and_repost: {e}", exc_info=True)
-        finally:
-            if conn:
-                conn.close()
         
     async def repost_job(self, context: ContextTypes.DEFAULT_TYPE):
         """Job to run reposting check"""
@@ -938,14 +871,11 @@ Narx
     async def repost_test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Test command to show what posts would be reposted (without actually reposting)"""
         try:
-            conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-            cursor = conn.cursor()
-            
             # Get posts that would be reposted
             interval_ago = datetime.now() - timedelta(days=self.repost_interval_days)
             interval_ago_str = interval_ago.strftime('%Y-%m-%d %H:%M:%S')
             
-            cursor.execute('''
+            posts = db.execute_fetchall('''
                 SELECT id, channel_message_id, channel_message_ids, text_content, repost_count, 
                        created_at, last_repost
                 FROM posts 
@@ -956,9 +886,6 @@ Narx
                 )
                 ORDER BY created_at ASC
             ''', (interval_ago_str, interval_ago_str))
-            
-            posts = cursor.fetchall()
-            conn.close()
             
             if not posts:
                 await update.message.reply_text(

@@ -3,47 +3,23 @@
 Database management script for BookBot
 """
 
-import sqlite3
 import sys
 from datetime import datetime, timedelta
+from database import db
 
 def init_database():
     """Initialize the database"""
-    conn = sqlite3.connect('bookbot.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message_id INTEGER,
-            channel_message_id INTEGER,
-            text_content TEXT,
-            image_path TEXT,
-            file_ids TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            repost_count INTEGER DEFAULT 0,
-            last_repost TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+    db.init_database()
     print("✅ Database initialized successfully!")
 
 def show_posts():
     """Show all posts"""
-    conn = sqlite3.connect('bookbot.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT id, user_id, created_at, repost_count, is_sold, 
+    posts = db.execute_fetchall('''
+        SELECT id, user_id, created_at, repost_count, 
                channel_message_id, text_content
         FROM posts 
         ORDER BY created_at DESC
     ''')
-    
-    posts = cursor.fetchall()
     
     if not posts:
         print("📭 No posts found in database.")
@@ -53,72 +29,52 @@ def show_posts():
     print("-" * 80)
     
     for post in posts:
-        post_id, user_id, created_at, repost_count, is_sold, channel_msg_id, text_content = post
-        status = "✅ SOLD" if is_sold else "🔄 ACTIVE"
+        post_id, user_id, created_at, repost_count, channel_msg_id, text_content = post
         print(f"ID: {post_id} | User: {user_id} | Created: {created_at}")
-        print(f"Status: {status} | Reposts: {repost_count} | Channel MSG: {channel_msg_id}")
+        print(f"Reposts: {repost_count} | Channel MSG: {channel_msg_id}")
         print(f"Content: {text_content[:100]}{'...' if len(text_content) > 100 else ''}")
         print("-" * 80)
-    
-    conn.close()
 
 
 def delete_post(post_id):
     """Delete a post"""
-    conn = sqlite3.connect('bookbot.db')
-    cursor = conn.cursor()
+    rowcount = db.execute('DELETE FROM posts WHERE id = ?', (post_id,))
     
-    cursor.execute('DELETE FROM posts WHERE id = ?', (post_id,))
-    
-    if cursor.rowcount > 0:
+    if rowcount > 0:
         print(f"✅ Post {post_id} deleted!")
     else:
         print(f"❌ Post {post_id} not found!")
-    
-    conn.commit()
-    conn.close()
 
 def cleanup_old_posts(days=30):
     """Clean up posts older than specified days"""
-    conn = sqlite3.connect('bookbot.db')
-    cursor = conn.cursor()
-    
     cutoff_date = datetime.now() - timedelta(days=days)
-    cursor.execute('DELETE FROM posts WHERE created_at < ?', (cutoff_date,))
+    deleted_count = db.execute('DELETE FROM posts WHERE created_at < ?', (cutoff_date,))
     
-    deleted_count = cursor.rowcount
     print(f"✅ Deleted {deleted_count} posts older than {days} days")
-    
-    conn.commit()
-    conn.close()
 
 def show_stats():
     """Show database statistics"""
-    conn = sqlite3.connect('bookbot.db')
-    cursor = conn.cursor()
-    
     # Total posts
-    cursor.execute('SELECT COUNT(*) FROM posts')
-    total_posts = cursor.fetchone()[0]
+    result = db.execute_fetchone('SELECT COUNT(*) FROM posts')
+    total_posts = result[0] if result else 0
     
     # Active posts (all posts are now active)
     active_posts = total_posts
     
     # Posts needing repost
     week_ago = datetime.now() - timedelta(days=7)
-    cursor.execute('''
+    week_ago_str = week_ago.strftime('%Y-%m-%d %H:%M:%S')
+    result = db.execute_fetchone('''
         SELECT COUNT(*) FROM posts 
-        WHERE created_at <= ? 
-        AND (last_repost IS NULL OR last_repost <= ?)
-    ''', (week_ago, week_ago))
-    repost_needed = cursor.fetchone()[0]
+        WHERE julianday(created_at) <= julianday(?) 
+        AND (last_repost IS NULL OR julianday(last_repost) <= julianday(?))
+    ''', (week_ago_str, week_ago_str))
+    repost_needed = result[0] if result else 0
     
     print("Database Statistics:")
     print(f"Total posts: {total_posts}")
     print(f"Active posts: {active_posts}")
     print(f"Posts needing repost: {repost_needed}")
-    
-    conn.close()
 
 def main():
     """Main function"""
