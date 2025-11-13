@@ -22,6 +22,29 @@ def convert_datetime(val):
 sqlite3.register_adapter(datetime, adapt_datetime_iso)
 sqlite3.register_converter("datetime", convert_datetime)
 
+def parse_db_datetime(dt_value):
+    """Safely parse datetime from database (handles both string and datetime objects)"""
+    if dt_value is None:
+        return None
+    if isinstance(dt_value, datetime):
+        return dt_value
+    if isinstance(dt_value, str):
+        # Try ISO format first
+        try:
+            return datetime.fromisoformat(dt_value.replace(' ', 'T'))
+        except ValueError:
+            # Try SQLite format: YYYY-MM-DD HH:MM:SS
+            try:
+                return datetime.strptime(dt_value, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                # Try just date
+                try:
+                    return datetime.strptime(dt_value, '%Y-%m-%d')
+                except ValueError:
+                    logger.warning(f"Could not parse datetime: {dt_value}")
+                    return None
+    return None
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
@@ -53,6 +76,7 @@ def init_database():
             user_id INTEGER,
             message_id INTEGER,
             channel_message_id INTEGER,
+            channel_message_ids TEXT,
             text_content TEXT,
             image_path TEXT,
             file_ids TEXT,
@@ -61,6 +85,12 @@ def init_database():
             last_repost TIMESTAMP
         )
     ''')
+    
+    # Add channel_message_ids column if it doesn't exist (for backward compatibility)
+    try:
+        cursor.execute('ALTER TABLE posts ADD COLUMN channel_message_ids TEXT')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     
     # Create admins table
     cursor.execute('''
@@ -76,10 +106,11 @@ def init_database():
     logger.info("Database initialized successfully")
 
 class BookBot:
-    def __init__(self, bot_token: str, channel_id: str, admin_ids: List[int] = None):
+    def __init__(self, bot_token: str, channel_id: str, admin_ids: List[int] = None, repost_interval_days: int = 7):
         self.bot_token = bot_token
         self.channel_id = channel_id
         self.admin_ids = admin_ids or []
+        self.repost_interval_days = repost_interval_days
         self.application = Application.builder().token(bot_token).build()
         self.setup_handlers()
         
@@ -89,6 +120,8 @@ class BookBot:
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("addadmin", self.add_admin_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
+        self.application.add_handler(CommandHandler("reposttest", self.repost_test_command))
+        self.application.add_handler(CommandHandler("repostnow", self.repost_now_command))
         self.application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         # Manual text handler removed - no manual text entry
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
@@ -210,12 +243,13 @@ Narx
             active_posts = total_posts
             
             # Posts needing repost
-            week_ago = datetime.now() - timedelta(days=7)
+            interval_ago = datetime.now() - timedelta(days=self.repost_interval_days)
+            interval_ago_str = interval_ago.strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute('''
                 SELECT COUNT(*) FROM posts 
-                WHERE created_at <= ? 
-                AND (last_repost IS NULL OR last_repost <= ?)
-            ''', (week_ago, week_ago))
+                WHERE julianday(created_at) <= julianday(?) 
+                AND (last_repost IS NULL OR julianday(last_repost) <= julianday(?))
+            ''', (interval_ago_str, interval_ago_str))
             repost_needed = cursor.fetchone()[0]
             
             conn.close()
@@ -560,7 +594,14 @@ Narx
             
             if channel_message:
                 # Update channel_message_id in database
-                self.update_channel_message_id(post_id, channel_message.message_id)
+                # Handle both single message and list of messages (for media groups)
+                if isinstance(channel_message, list):
+                    # Media group: store all message IDs
+                    message_ids = [msg.message_id for msg in channel_message]
+                    self.update_channel_message_id(post_id, channel_message[0].message_id, message_ids)
+                else:
+                    # Single message
+                    self.update_channel_message_id(post_id, channel_message.message_id, [channel_message.message_id])
                 
                 # Send success message
                 photo_count = len(photos)
@@ -701,7 +742,8 @@ Narx
                     media=media_group
                 )
                 
-                return messages[0]  # Return first message for tracking
+                # Return all messages for tracking (for media groups)
+                return messages
             else:
                 # Single photo using file_id
                 message = await context.bot.send_photo(
@@ -717,13 +759,23 @@ Narx
             logger.error(f"Post to channel error: {e}")
             return None
             
-    # send_admin_sold_button function removed - Sotildi functionality removed
-            
-    def update_channel_message_id(self, post_id: int, channel_message_id: int):
-        """Update channel message ID in database"""
+    def update_channel_message_id(self, post_id: int, channel_message_id: int, all_message_ids: list = None):
+        """Update channel message ID(s) in database"""
         conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
         cursor = conn.cursor()
-        cursor.execute('UPDATE posts SET channel_message_id = ? WHERE id = ?', (channel_message_id, post_id))
+        
+        # Store all message IDs as JSON for media groups
+        if all_message_ids:
+            message_ids_json = json.dumps(all_message_ids)
+            cursor.execute('''
+                UPDATE posts 
+                SET channel_message_id = ?, channel_message_ids = ? 
+                WHERE id = ?
+            ''', (channel_message_id, message_ids_json, post_id))
+        else:
+            # Backward compatibility: if no list provided, just store single ID
+            cursor.execute('UPDATE posts SET channel_message_id = ? WHERE id = ?', (channel_message_id, post_id))
+        
         conn.commit()
         conn.close()
             
@@ -748,66 +800,232 @@ Narx
         return post_id
         
     async def check_and_repost(self, context: ContextTypes.DEFAULT_TYPE):
-        """Check for posts that need reposting (weekly)"""
-        conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
-        cursor = conn.cursor()
-        
-        # Get posts that are 7 days old and need reposting
-        week_ago = datetime.now() - timedelta(days=7)
-        cursor.execute('''
-            SELECT id, channel_message_id, text_content, image_path, file_ids, repost_count
-            FROM posts 
-            WHERE created_at <= ? 
-            AND (last_repost IS NULL OR last_repost <= ?)
-        ''', (week_ago, week_ago))
-        
-        posts = cursor.fetchall()
-        
-        for post in posts:
-            post_id, channel_message_id, text_content, image_path, file_ids_json, repost_count = post
+        """Check for posts that need reposting"""
+        conn = None
+        try:
+            conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
+            cursor = conn.cursor()
             
-            try:
-                # Delete old message from channel
-                if channel_message_id:
-                    await context.bot.delete_message(chat_id=self.channel_id, message_id=channel_message_id)
+            # Get posts that are older than repost_interval_days and need reposting
+            # Logic: Repost if:
+            # 1. Post was created more than repost_interval_days ago AND has never been reposted (last_repost IS NULL)
+            # 2. OR post was last reposted more than repost_interval_days ago
+            interval_ago = datetime.now() - timedelta(days=self.repost_interval_days)
+            interval_ago_str = interval_ago.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Improved query: Check if created_at is old enough, and either never reposted or last repost is old enough
+            # Use julianday() for more reliable date comparisons in SQLite
+            cursor.execute('''
+                SELECT id, channel_message_id, channel_message_ids, text_content, image_path, file_ids, repost_count, 
+                       created_at, last_repost
+                FROM posts 
+                WHERE julianday(created_at) <= julianday(?)
+                AND (
+                    last_repost IS NULL 
+                    OR julianday(last_repost) <= julianday(?)
+                )
+            ''', (interval_ago_str, interval_ago_str))
+            
+            posts = cursor.fetchall()
+            logger.info(f"Repost check: Found {len(posts)} posts that need reposting (older than {self.repost_interval_days} days)")
+            
+            # Log details for debugging
+            for post in posts:
+                post_id, _, _, _, _, _, repost_count, created_at, last_repost = post
+                created_dt = parse_db_datetime(created_at)
+                last_repost_dt = parse_db_datetime(last_repost)
                 
-                # Determine which data format to use (backward compatibility)
-                if file_ids_json:
-                    # New format: use file_ids
-                    try:
-                        file_ids = json.loads(file_ids_json)
-                        new_message = await self.post_to_channel(text_content, file_ids, post_id, context)
-                    except (json.JSONDecodeError, TypeError) as e:
-                        logger.error(f"Error parsing file_ids for post {post_id}: {e}")
-                        continue
-                elif image_path:
-                    # Old format: convert single image_path to list for compatibility
-                    file_ids = [image_path]  # This won't work with new post_to_channel, but we'll handle it
-                    logger.warning(f"Post {post_id} uses old image_path format, skipping repost")
-                    continue
+                if created_dt:
+                    created_days_ago = (datetime.now() - created_dt).days
+                    if last_repost_dt:
+                        last_repost_days_ago = (datetime.now() - last_repost_dt).days
+                        logger.info(f"  Post {post_id}: Created {created_days_ago} days ago, last reposted {last_repost_days_ago} days ago (repost count: {repost_count})")
+                    else:
+                        logger.info(f"  Post {post_id}: Created {created_days_ago} days ago, never reposted (repost count: {repost_count})")
                 else:
-                    logger.error(f"No valid image data for post {post_id}")
-                    continue
+                    logger.warning(f"  Post {post_id}: Could not parse created_at: {created_at}")
+            
+            for post in posts:
+                post_id, channel_message_id, channel_message_ids_json, text_content, image_path, file_ids_json, repost_count, created_at, last_repost = post
                 
-                if new_message:
-                    # Update database
-                    cursor.execute('''
-                        UPDATE posts 
-                        SET channel_message_id = ?, repost_count = ?, last_repost = ?
-                        WHERE id = ?
-                    ''', (new_message.message_id, repost_count + 1, datetime.now(), post_id))
+                try:
+                    # Get all message IDs to delete (for media groups)
+                    message_ids_to_delete = []
                     
-                    logger.info(f"Reposted book post {post_id}")
+                    # First try to get from channel_message_ids (new format)
+                    if channel_message_ids_json:
+                        try:
+                            message_ids_to_delete = json.loads(channel_message_ids_json)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
                     
-            except Exception as e:
-                logger.error(f"Repost error for post {post_id}: {e}")
-        
-        conn.commit()
-        conn.close()
+                    # Fallback to single channel_message_id (backward compatibility)
+                    if not message_ids_to_delete and channel_message_id:
+                        message_ids_to_delete = [channel_message_id]
+                    
+                    # Delete ALL old messages from channel BEFORE posting new one
+                    if message_ids_to_delete:
+                        for msg_id in message_ids_to_delete:
+                            try:
+                                await context.bot.delete_message(chat_id=self.channel_id, message_id=msg_id)
+                                logger.info(f"Deleted old message {msg_id} for post {post_id}")
+                            except Exception as e:
+                                # Message might already be deleted, log but continue
+                                logger.warning(f"Could not delete message {msg_id} for post {post_id}: {e}")
+                    
+                    # Determine which data format to use (backward compatibility)
+                    new_message = None
+                    if file_ids_json:
+                        # New format: use file_ids
+                        try:
+                            file_ids = json.loads(file_ids_json)
+                            new_message = await self.post_to_channel(text_content, file_ids, post_id, context)
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logger.error(f"Error parsing file_ids for post {post_id}: {e}")
+                            continue
+                    elif image_path:
+                        # Old format: convert single image_path to list for compatibility
+                        file_ids = [image_path]  # This won't work with new post_to_channel, but we'll handle it
+                        logger.warning(f"Post {post_id} uses old image_path format, skipping repost")
+                        continue
+                    else:
+                        logger.error(f"No valid image data for post {post_id}")
+                        continue
+                    
+                    if new_message:
+                        # Update database with new message ID(s)
+                        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        # Handle both single message and list of messages (for media groups)
+                        if isinstance(new_message, list):
+                            # Media group: store all message IDs
+                            new_message_ids = [msg.message_id for msg in new_message]
+                            new_message_ids_json = json.dumps(new_message_ids)
+                            cursor.execute('''
+                                UPDATE posts 
+                                SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                                WHERE id = ?
+                            ''', (new_message[0].message_id, new_message_ids_json, repost_count + 1, now_str, post_id))
+                        else:
+                            # Single message
+                            single_id_json = json.dumps([new_message.message_id])
+                            cursor.execute('''
+                                UPDATE posts 
+                                SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                                WHERE id = ?
+                            ''', (new_message.message_id, single_id_json, repost_count + 1, now_str, post_id))
+                        
+                        logger.info(f"Successfully reposted book post {post_id} (repost count: {repost_count + 1})")
+                    else:
+                        logger.error(f"Failed to post new message for post {post_id}")
+                        
+                except Exception as e:
+                    logger.error(f"Repost error for post {post_id}: {e}", exc_info=True)
+            
+            if conn:
+                conn.commit()
+            logger.info(f"Repost check completed. Processed {len(posts)} posts.")
+        except Exception as e:
+            logger.error(f"Error in check_and_repost: {e}", exc_info=True)
+        finally:
+            if conn:
+                conn.close()
         
     async def repost_job(self, context: ContextTypes.DEFAULT_TYPE):
         """Job to run reposting check"""
         await self.check_and_repost(context)
+    
+    async def repost_test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Test command to show what posts would be reposted (without actually reposting)"""
+        try:
+            conn = sqlite3.connect('bookbot.db', detect_types=sqlite3.PARSE_DECLTYPES|sqlite3.PARSE_COLNAMES)
+            cursor = conn.cursor()
+            
+            # Get posts that would be reposted
+            interval_ago = datetime.now() - timedelta(days=self.repost_interval_days)
+            interval_ago_str = interval_ago.strftime('%Y-%m-%d %H:%M:%S')
+            
+            cursor.execute('''
+                SELECT id, channel_message_id, channel_message_ids, text_content, repost_count, 
+                       created_at, last_repost
+                FROM posts 
+                WHERE julianday(created_at) <= julianday(?)
+                AND (
+                    last_repost IS NULL 
+                    OR julianday(last_repost) <= julianday(?)
+                )
+                ORDER BY created_at ASC
+            ''', (interval_ago_str, interval_ago_str))
+            
+            posts = cursor.fetchall()
+            conn.close()
+            
+            if not posts:
+                await update.message.reply_text(
+                    f"📊 **Repost Test Results**\n\n"
+                    f"✅ No posts need reposting right now.\n\n"
+                    f"All posts are either:\n"
+                    f"• Less than {self.repost_interval_days} days old\n"
+                    f"• Were reposted less than {self.repost_interval_days} days ago",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Build detailed report
+            report_lines = [
+                f"📊 **Repost Test Results**\n",
+                f"Found **{len(posts)}** post(s) that would be reposted:\n"
+            ]
+            
+            for post in posts:
+                post_id, channel_message_id, channel_message_ids_json, text_content, repost_count, created_at, last_repost = post
+                
+                # Parse dates using helper function
+                created_dt = parse_db_datetime(created_at)
+                last_repost_dt = parse_db_datetime(last_repost)
+                
+                if created_dt:
+                    created_days_ago = (datetime.now() - created_dt).days
+                else:
+                    created_days_ago = "Unknown"
+                
+                # Get first line of text content for preview
+                text_preview = text_content.split('\n')[0][:30] + "..." if text_content else "No text"
+                
+                report_lines.append(f"\n**Post ID:** {post_id}")
+                report_lines.append(f"📝 Preview: {text_preview}")
+                report_lines.append(f"📅 Created: {created_days_ago} days ago")
+                report_lines.append(f"🔄 Repost count: {repost_count}")
+                
+                if last_repost_dt:
+                    last_repost_days_ago = (datetime.now() - last_repost_dt).days
+                    report_lines.append(f"⏰ Last repost: {last_repost_days_ago} days ago")
+                else:
+                    report_lines.append(f"⏰ Last repost: Never")
+            
+            report_lines.append(f"\n\n💡 Use `/repostnow` to actually repost these.")
+            
+            report_text = "\n".join(report_lines)
+            
+            # Split if too long (Telegram has 4096 char limit)
+            if len(report_text) > 4000:
+                report_text = report_text[:4000] + "\n\n... (truncated)"
+            
+            await update.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
+            
+        except Exception as e:
+            logger.error(f"/reposttest error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+    
+    async def repost_now_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Manually trigger repost check (for testing)"""
+        try:
+            await update.message.reply_text("🔄 Starting repost check...")
+            await self.check_and_repost(context)
+            await update.message.reply_text("✅ Repost check completed. Check logs for details.")
+        except Exception as e:
+            logger.error(f"/repostnow error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error executing repost check: {str(e)}")
         
     def run(self):
         """Start the bot"""
@@ -844,16 +1062,24 @@ def main():
     ADMIN_IDS = os.getenv('ADMIN_IDS', '').split(',') if os.getenv('ADMIN_IDS') else []
     ADMIN_IDS = [int(admin_id.strip()) for admin_id in ADMIN_IDS if admin_id.strip().isdigit()]
     
+    # Get repost interval (default: 7 days)
+    repost_interval_days = 7
+    repost_interval_env = os.getenv('REPOST_INTERVAL_DAYS')
+    if repost_interval_env and repost_interval_env.isdigit():
+        repost_interval_days = int(repost_interval_env)
+        logger.info(f"Repost interval set to {repost_interval_days} days from .env file")
+    
     if not BOT_TOKEN or not CHANNEL_ID:
         print("❌ Please set BOT_TOKEN and CHANNEL_ID environment variables!")
         print("Example:")
         print("BOT_TOKEN=your_bot_token")
         print("CHANNEL_ID=@your_channel")
         print("ADMIN_IDS=123456789,987654321  # Optional")
+        print("REPOST_INTERVAL_DAYS=7  # Optional, default is 7 days")
         return
         
     # Create and run bot
-    bot = BookBot(BOT_TOKEN, CHANNEL_ID, ADMIN_IDS)
+    bot = BookBot(BOT_TOKEN, CHANNEL_ID, ADMIN_IDS, repost_interval_days)
     bot.run()
 
 if __name__ == '__main__':
