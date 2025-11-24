@@ -49,6 +49,7 @@ def parse_db_datetime(dt_value):
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, TelegramError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -802,14 +803,38 @@ Narx
                         message_ids_to_delete = [channel_message_id]
                     
                     # Delete ALL old messages from channel BEFORE posting new one
+                    # Track deletion results to determine if we should skip reposting
+                    messages_not_found_count = 0
+                    messages_deleted_count = 0
+                    messages_cant_delete_count = 0
+                    
                     if message_ids_to_delete:
                         for msg_id in message_ids_to_delete:
                             try:
                                 await context.bot.delete_message(chat_id=self.channel_id, message_id=msg_id)
                                 logger.info(f"Deleted old message {msg_id} for post {post_id}")
+                                messages_deleted_count += 1
+                            except BadRequest as e:
+                                error_msg = str(e).lower()
+                                if "message to delete not found" in error_msg or "message not found" in error_msg:
+                                    # Message already deleted (manually removed from channel)
+                                    messages_not_found_count += 1
+                                    logger.info(f"Message {msg_id} for post {post_id} was already deleted")
+                                elif "message can't be deleted" in error_msg or "can't delete" in error_msg or "not enough rights" in error_msg:
+                                    # Forwarded message or permission issue - message exists but can't be deleted
+                                    messages_cant_delete_count += 1
+                                    logger.warning(f"Cannot delete message {msg_id} for post {post_id} - likely a forwarded message or insufficient permissions: {e}")
+                                    # Continue with repost anyway
+                                else:
+                                    logger.warning(f"Could not delete message {msg_id} for post {post_id}: {e}")
                             except Exception as e:
-                                # Message might already be deleted, log but continue
+                                # Other errors - log but continue
                                 logger.warning(f"Could not delete message {msg_id} for post {post_id}: {e}")
+                        
+                        # If all messages were "not found" (manually deleted), skip reposting
+                        if messages_not_found_count == len(message_ids_to_delete) and len(message_ids_to_delete) > 0:
+                            logger.info(f"Skipping repost for post {post_id} - all messages were manually deleted from channel")
+                            continue
                     
                     # Determine which data format to use (backward compatibility)
                     new_message = None
