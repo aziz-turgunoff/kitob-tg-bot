@@ -4,11 +4,14 @@ Bu bot orqali siz kitob rasmlarini yuborib, ularni avtomatik ravishda Telegram k
 
 ## ✨ Xususiyatlar
 
-- 📸 **Rasm qayta ishlash**: Kitob rasmlarini qabul qiladi va OCR yordamida matn o'qiydi
+- 📸 **Rasm qayta ishlash**: Kitob rasmlarini qabul qiladi va avtomatik ravishda kanalga joylashtiradi
 - 🤖 **Avtomatik formatlash**: Matnlarni belgilangan formatda kanalga joylashtiradi
-- 🔄 **Avtomatik qayta joylashtirish**: 1 hafta ichida sotilmagan kitoblar avtomatik ravishda qayta joylashtiriladi
-- 💾 **Ma'lumotlar bazasi**: Barcha postlar SQLite ma'lumotlar bazasida saqlanadi
-- ✏️ **Qo'lda tahrirlash**: OCR natijalarini qo'lda tahrirlash imkoniyati
+- 🔄 **Avtomatik qayta joylashtirish**: Belgilangan kunlardan keyin sotilmagan kitoblar avtomatik ravishda qayta joylashtiriladi
+- 📅 **Sanaga bo'yicha qayta joylashtirish**: Admin foydalanuvchilar ma'lum sanadan kitoblarni qayta joylashtirishlari mumkin
+- 💾 **Ma'lumotlar bazasi**: Barcha postlar SQLite yoki PostgreSQL ma'lumotlar bazasida saqlanadi
+- 🚀 **Async operatsiyalar**: Event loop blokiravchi operatsiyalar yo'q, Railway ga optimal
+- 🔁 **Intelligent Reposting**: O'chirilgan postlarni qayta joylashtirmaydi, xatoliklarni to'g'ri boshqaradi
+- ⏱️ **Rate-limit xavfsizligi**: Telegram rate-limitlarini hurmat qiladi, eksponensial backoff ishlatadi
 
 ## 🚀 O'rnatish
 
@@ -28,35 +31,27 @@ Yoki qo'lda:
 pip install -r requirements.txt
 ```
 
-### 3. Tesseract OCR o'rnatish
+### 3. .env faylini sozlash
 
-#### Windows:
-1. [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) ni yuklab oling
-2. Standart joyga o'rnating: `C:\Program Files\Tesseract-OCR\`
-3. O'zbek tili paketini yuklab oling (ixtiyoriy)
-
-#### Linux:
-```bash
-sudo apt-get install tesseract-ocr tesseract-ocr-uzb
-```
-
-#### macOS:
-```bash
-brew install tesseract tesseract-lang
-```
-
-### 4. Bot token va kanal ID ni o'rnatish
-
-`.env` faylini tahrirlang:
+`.env` faylini tahrirlang (env.example-dan nusxa oling):
 ```env
 BOT_TOKEN=your_bot_token_here
 CHANNEL_ID=@your_channel_username
-TESSERACT_PATH=C:\Program Files\Tesseract-OCR\tesseract.exe
+ADMIN_IDS=123456789,987654321
+REPOST_INTERVAL_DAYS=7
 ```
 
-### 5. Botni ishga tushirish
+### 4. Botni ishga tushirish
 ```bash
 python bookbot.py
+```
+
+**Railway-da deployment:**
+```bash
+railway login
+railway link
+railway variables set BOT_TOKEN=... CHANNEL_ID=... ADMIN_IDS=...
+railway up
 ```
 
 ## 📖 Foydalanish
@@ -64,6 +59,11 @@ python bookbot.py
 ### Bot buyruqlari:
 - `/start` - Botni ishga tushirish
 - `/help` - Yordam olish
+- `/status` - Bot statusini ko'rish
+- `/reposttest` - Qayta joylashtiriladigan postlarni ko'rish (sinov)
+- `/repostnow` - Hoziroq qayta joylashtirish tekshirivini boshlash
+- `/repost_now dd.mm.yyyy` - **ADMIN**: Ma'lum sanadan kitoblarni qayta joylashtirish (masalan: `/repost_now 11.12.2025`)
+- `/addadmin` - Admin foydalanuvchi qo'shish (faqat adminlar uchun)
 
 ### Kitob yuborish:
 1. Kitob rasmini yuboring
@@ -100,16 +100,48 @@ Narx
 
 ## 🔧 Sozlash
 
+### Environment variables (.env fayli)
+```env
+# Majburiy sozlamalar
+BOT_TOKEN=your_bot_token_here
+CHANNEL_ID=@your_channel_username
+
+# Ixtiyoriy sozlamalar
+ADMIN_IDS=123456789,987654321          # Admin foydalanuvchilar (vergul bilan ajratilgan)
+REPOST_INTERVAL_DAYS=7                 # Qayta joylashtirish oralig'i kunlarda (standart: 7)
+DATABASE_URL=postgresql://...          # PostgreSQL URL (yo'q bo'lsa SQLite ishlatiladi)
+```
+
 ### Ma'lumotlar bazasi
-Bot SQLite ma'lumotlar bazasidan foydalanadi (`bookbot.db`). Barcha postlar va ularning holati saqlanadi.
+Bot sukut bo'yicha SQLite ma'lumotlar bazasidan foydalanadi (`bookbot.db`). Railway-da deployment uchun `DATABASE_URL` o'rnatib PostgreSQL-dan foydalanishni tavsiya qilamiz.
+
+**PostgreSQL o'rnatish** (Railway):
+```
+railway link
+# Keyin DATABASE_URL avtomatik o'rnatiladi
+```
 
 ### Qayta joylashtirish
-- Kitoblar 1 hafta (7 kun) dan keyin avtomatik ravishda qayta joylashtiriladi
-- Eski post o'chiriladi va yangisi yuboriladi
-- Qayta joylashtirish sanasi ma'lumotlar bazasida saqlanadi
 
-### Rasm saqlash
-Barcha rasm fayllar `images/` papkasida saqlanadi.
+**Avtomatik qayta joylashtirish:**
+- Kitoblar `REPOST_INTERVAL_DAYS` kundan keyin (standart: 7 kun) avtomatik ravishda qayta joylashtiriladi
+- Eski post o'chiriladi va yangisi yuboriladi
+- O'chirilgan postlar qayta joylashtirilmaydi
+- Xatoliklarni to'g'ri boshqaradi va logs-da kayid qiladi
+
+**Qo'lda qayta joylashtirish:**
+```
+Admin: /repost_now 11.12.2025
+Bot: Barcha 2025-12-11 kunida yaratilgan kitoblarni qayta joylashtiradi (Tashkent vaqti)
+```
+
+### Xatolik boshqaruvi
+
+**V2.0+ jadavallari:**
+- ✅ Media-group xatolari to'g'ri qayd qilinadi (error log ko'rsatiladi, lekin DB ga yozilmaydi)
+- ✅ O'chirilgan postlar aniqlaniadi va o'tkazilib yuboriladi
+- ✅ Telegram rate-limit-larini hurmat qiladi (eksponensial backoff)
+- ✅ Async DB operatsiyalar event loop-ni blokiramaydi
 
 ## 📁 Loyiha tuzilishi
 
@@ -139,6 +171,25 @@ sqlite3 bookbot.db
 .tables
 SELECT * FROM posts;
 ```
+
+## 🐛 V2.0 Xatolik Tuzatishlari va Yaxshilanishlari
+
+### Problem 1: O'chirilgan postlarni qayta joylashtirish
+**Muammo**: Bot ba'zida kanaldan o'chirilgan postlarni qayta joylashtirar edi.
+**Yechim**: Bot endi o'chirilgan postlarni aniqlaydi va o'tkazib yuboradi (xatolik logli qo'shiladi).
+
+### Problem 2: Media xatoliklari DB-ga yozilmasligi
+**Muammo**: Media yuborishdagi xatolik logs-ga ko'rinishiga qaramay DB-da "reposted" sifatida belgilana edi.
+**Yechim**: Endi xatoliklarni to'g'ri boshqaradi, faqat muvaffaqiyatli yuborishdagina DB-ga yozadi.
+
+### Problem 3: Sanaga bo'yicha qayta joylashtirish
+**Yechim**: `/repost_now dd.mm.yyyy` buyrug'i qo'shildi (Tashkent vaqti). Masalan: `/repost_now 11.12.2025`
+
+### V2.0 Texnik Yaxshilanishlari
+- ✅ Async DB wrapper-lar (event loop blokiravchi operatsiyalar yo'q)
+- ✅ Telegram rate-limit handling (eksponensial backoff)
+- ✅ Specific exception handling (xatoliklar to'liq qayd qilinadi)
+- ✅ PostgreSQL qo'llab-quvvatlash (Railway-da cheklangan DB uchun)
 
 ## 📝 Litsenziya
 
