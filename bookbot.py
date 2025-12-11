@@ -4,6 +4,7 @@ import sqlite3
 import asyncio
 import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import List, Optional
 import re
 import hashlib
@@ -49,10 +50,26 @@ def parse_db_datetime(dt_value):
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, RetryAfter
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Async DB wrapper functions to avoid blocking the event loop
+async def async_db_execute(query: str, params: tuple = None):
+    """Execute non-blocking DB write operation"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: db.execute(query, params))
+
+async def async_db_fetchone(query: str, params: tuple = None):
+    """Fetch one DB result non-blocking"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: db.execute_fetchone(query, params))
+
+async def async_db_fetchall(query: str, params: tuple = None):
+    """Fetch all DB results non-blocking"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: db.execute_fetchall(query, params))
 
 # Global file mapping for callback data
 file_mappings = {}
@@ -85,7 +102,9 @@ class BookBot:
         self.application.add_handler(CommandHandler("addadmin", self.add_admin_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("reposttest", self.repost_test_command))
+        # Support both /repostnow and /repost_now dd.mm.yyyy (Uzbekistan timezone)
         self.application.add_handler(CommandHandler("repostnow", self.repost_now_command))
+        self.application.add_handler(CommandHandler("repost_now", self.repost_now_by_date_command))
         self.application.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         # Manual text handler removed - no manual text entry
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
@@ -644,6 +663,61 @@ Narx
         elif message.text:
             return message.text
         return None
+    
+    async def repost_with_copy_message(self, context: ContextTypes.DEFAULT_TYPE, from_chat_id: int, 
+                                       message_id: int, text_content: str, max_retries: int = 3) -> Optional[int]:
+        """Copy a message from channel to channel with exponential backoff for rate-limiting.
+        Returns: new message_id on success, None on failure"""
+        backoff = 1  # Start with 1 second
+        
+        for attempt in range(max_retries):
+            try:
+                # Use Telegram's copy_message API - efficient and avoids re-upload
+                copied_msg = await context.bot.copy_message(
+                    chat_id=self.channel_id,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id,
+                    caption=None  # Don't duplicate caption; message already has its content
+                )
+                logger.info(f"Copied message {message_id} to channel, new id: {copied_msg.message_id}")
+                return copied_msg.message_id
+            
+            except RetryAfter as e:
+                # Telegram rate-limited us; respect the server's backoff
+                wait_time = e.retry_after
+                logger.warning(f"RetryAfter from Telegram: waiting {wait_time} seconds (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+                continue
+            
+            except BadRequest as e:
+                err_str = str(e).lower()
+                if "not found" in err_str or "deleted" in err_str:
+                    logger.error(f"Message {message_id} not found or deleted: {e}")
+                    return None
+                elif attempt < max_retries - 1:
+                    logger.warning(f"BadRequest copying message {message_id} (attempt {attempt + 1}/{max_retries}): {e}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30)  # Cap at 30 seconds
+                    continue
+                else:
+                    logger.error(f"Failed to copy message {message_id} after {max_retries} attempts: {e}")
+                    return None
+            
+            except TelegramError as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"TelegramError copying message {message_id} (attempt {attempt + 1}/{max_retries}): {e}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                    continue
+                else:
+                    logger.error(f"Failed to copy message {message_id} after {max_retries} attempts: {e}")
+                    return None
+            
+            except Exception as e:
+                logger.error(f"Unexpected error copying message {message_id}: {e}", exc_info=True)
+                return None
+        
+        return None
         
     async def post_to_channel(self, text_content: str, file_ids: list, post_id: int, context: ContextTypes.DEFAULT_TYPE):
         """Post book to channel with formatted text and multiple photos using file_ids"""
@@ -671,7 +745,7 @@ Narx
             if len(file_ids) > 1:
                 # Send as media group for multiple photos using file_ids
                 media_group = []
-                
+
                 for i, file_id in enumerate(file_ids):
                     if i == 0:
                         # First photo gets the caption
@@ -685,26 +759,43 @@ Narx
                         media_group.append(InputMediaPhoto(
                             media=file_id
                         ))
-                
-                # Send media group
-                messages = await context.bot.send_media_group(
-                    chat_id=self.channel_id,
-                    media=media_group
-                )
-                
-                # Return all messages for tracking (for media groups)
-                return messages
+
+                # Send media group with targeted exception handling
+                try:
+                    messages = await context.bot.send_media_group(
+                        chat_id=self.channel_id,
+                        media=media_group
+                    )
+                    return messages
+                except BadRequest as e:
+                    logger.error(f"send_media_group BadRequest: {e}", exc_info=True)
+                    return None
+                except TelegramError as e:
+                    logger.error(f"send_media_group TelegramError: {e}", exc_info=True)
+                    return None
+                except Exception as e:
+                    logger.error(f"Unexpected error in send_media_group: {e}", exc_info=True)
+                    return None
             else:
                 # Single photo using file_id
-                message = await context.bot.send_photo(
-                    chat_id=self.channel_id,
-                    photo=file_ids[0],
-                    caption=formatted_text,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-                return message
-                
+                try:
+                    message = await context.bot.send_photo(
+                        chat_id=self.channel_id,
+                        photo=file_ids[0],
+                        caption=formatted_text,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    return message
+                except BadRequest as e:
+                    logger.error(f"send_photo BadRequest: {e}", exc_info=True)
+                    return None
+                except TelegramError as e:
+                    logger.error(f"send_photo TelegramError: {e}", exc_info=True)
+                    return None
+                except Exception as e:
+                    logger.error(f"Unexpected error in send_photo: {e}", exc_info=True)
+                    return None
+            
         except Exception as e:
             logger.error(f"Post to channel error: {e}")
             return None
@@ -745,7 +836,7 @@ Narx
         return db.execute_with_cursor(execute_insert)
         
     async def check_and_repost(self, context: ContextTypes.DEFAULT_TYPE):
-        """Check for posts that need reposting"""
+        """Check for posts that need reposting (using async DB wrappers to avoid blocking event loop)"""
         try:
             # Get posts that are older than repost_interval_days and need reposting
             # Logic: Repost if:
@@ -756,7 +847,7 @@ Narx
             
             # Improved query: Check if created_at is old enough, and either never reposted or last repost is old enough
             # Use julianday() for more reliable date comparisons in SQLite
-            posts = db.execute_fetchall('''
+            posts = await async_db_fetchall('''
                 SELECT id, channel_message_id, channel_message_ids, text_content, image_path, file_ids, repost_count, 
                        created_at, last_repost
                 FROM posts 
@@ -808,6 +899,11 @@ Narx
                     messages_deleted_count = 0
                     messages_cant_delete_count = 0
                     
+                    if not message_ids_to_delete:
+                        # If we don't have any recorded channel message ids, skip reposting
+                        logger.info(f"Skipping repost for post {post_id} - no recorded channel message id(s)")
+                        continue
+
                     if message_ids_to_delete:
                         for msg_id in message_ids_to_delete:
                             try:
@@ -830,10 +926,10 @@ Narx
                             except Exception as e:
                                 # Other errors - log but continue
                                 logger.warning(f"Could not delete message {msg_id} for post {post_id}: {e}")
-                        
-                        # If all messages were "not found" (manually deleted), skip reposting
-                        if messages_not_found_count == len(message_ids_to_delete) and len(message_ids_to_delete) > 0:
-                            logger.info(f"Skipping repost for post {post_id} - all messages were manually deleted from channel")
+
+                        # If any message was "not found" (manually deleted), skip reposting
+                        if messages_not_found_count > 0:
+                            logger.info(f"Skipping repost for post {post_id} - one or more messages were manually deleted from channel")
                             continue
                     
                     # Determine which data format to use (backward compatibility)
@@ -856,7 +952,7 @@ Narx
                         continue
                     
                     if new_message:
-                        # Update database with new message ID(s)
+                        # Update database with new message ID(s) using async wrapper
                         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         
                         # Handle both single message and list of messages (for media groups)
@@ -864,7 +960,7 @@ Narx
                             # Media group: store all message IDs
                             new_message_ids = [msg.message_id for msg in new_message]
                             new_message_ids_json = json.dumps(new_message_ids)
-                            db.execute('''
+                            await async_db_execute('''
                                 UPDATE posts 
                                 SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
                                 WHERE id = ?
@@ -872,7 +968,7 @@ Narx
                         else:
                             # Single message
                             single_id_json = json.dumps([new_message.message_id])
-                            db.execute('''
+                            await async_db_execute('''
                                 UPDATE posts 
                                 SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
                                 WHERE id = ?
@@ -978,6 +1074,147 @@ Narx
         except Exception as e:
             logger.error(f"/repostnow error: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Error executing repost check: {str(e)}")
+
+    async def repost_now_by_date_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Repost posts created on a specific date. Usage: /repost_now dd.mm.yyyy (Uzbekistan timezone)
+        This will skip reposting if any original channel message is already deleted.
+        """
+        try:
+            # Check if user is admin
+            if not self.is_admin(update.effective_user.id):
+                await update.message.reply_text("❌ Only admins can use this command.")
+                return
+            
+            # Parse date argument
+            args = context.args if hasattr(context, 'args') else []
+            if not args or len(args) < 1:
+                await update.message.reply_text("❌ Please provide a date in format dd.mm.yyyy\nExample: /repost_now 01.12.2025")
+                return
+
+            date_str = args[0].strip()
+            try:
+                day, month, year = [int(x) for x in date_str.split('.')]
+                tz = ZoneInfo('Asia/Tashkent')
+                start_dt_tz = datetime(year, month, day, 0, 0, 0, tzinfo=tz)
+                end_dt_tz = start_dt_tz + timedelta(days=1)
+                # Convert to UTC for DB comparisons (Railway/servers typically use UTC)
+                start_utc = start_dt_tz.astimezone(ZoneInfo('UTC')).replace(tzinfo=None)
+                end_utc = end_dt_tz.astimezone(ZoneInfo('UTC')).replace(tzinfo=None)
+                start_str = start_utc.strftime('%Y-%m-%d %H:%M:%S')
+                end_str = end_utc.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                await update.message.reply_text("❌ Invalid date format. Use dd.mm.yyyy")
+                return
+
+            await update.message.reply_text(f"🔄 Reposting posts from {date_str} (Asia/Tashkent)...")
+
+            # Query posts created in the given UTC range using async wrapper
+            posts = await async_db_fetchall('''
+                SELECT id, channel_message_id, channel_message_ids, text_content, image_path, file_ids, repost_count, 
+                       created_at, last_repost
+                FROM posts
+                WHERE created_at >= ? AND created_at < ?
+                ORDER BY created_at ASC
+            ''', (start_str, end_str))
+
+            if not posts:
+                await update.message.reply_text("ℹ️ No posts found for that date.")
+                return
+
+            await update.message.reply_text(f"📌 Found {len(posts)} post(s). Starting repost... This may take a while.")
+
+            processed = 0
+            skipped = 0
+
+            for post in posts:
+                post_id, channel_message_id, channel_message_ids_json, text_content, image_path, file_ids_json, repost_count, created_at, last_repost = post
+                try:
+                    # Build message id list
+                    message_ids_to_delete = []
+                    if channel_message_ids_json:
+                        try:
+                            message_ids_to_delete = json.loads(channel_message_ids_json)
+                        except Exception:
+                            message_ids_to_delete = []
+                    if not message_ids_to_delete and channel_message_id:
+                        message_ids_to_delete = [channel_message_id]
+
+                    if not message_ids_to_delete:
+                        logger.info(f"Skipping repost for post {post_id} - no recorded channel message id(s)")
+                        skipped += 1
+                        continue
+
+                    # Try to delete old messages first; if any are not found => skip repost
+                    any_not_found = False
+                    for msg_id in message_ids_to_delete:
+                        try:
+                            await context.bot.delete_message(chat_id=self.channel_id, message_id=msg_id)
+                            logger.info(f"Deleted old message {msg_id} for post {post_id} (date repost)")
+                        except BadRequest as e:
+                            err = str(e).lower()
+                            if "message to delete not found" in err or "message not found" in err:
+                                any_not_found = True
+                                logger.info(f"Message {msg_id} for post {post_id} already deleted (date repost) - skipping")
+                            else:
+                                logger.warning(f"Could not delete message {msg_id} for post {post_id} (date repost): {e}")
+                        except Exception as e:
+                            logger.warning(f"Unexpected error deleting message {msg_id} for post {post_id}: {e}")
+
+                    if any_not_found:
+                        skipped += 1
+                        continue
+
+                    # Prepare file_ids
+                    if file_ids_json:
+                        try:
+                            file_ids = json.loads(file_ids_json)
+                        except Exception:
+                            logger.error(f"Invalid file_ids JSON for post {post_id}")
+                            skipped += 1
+                            continue
+                    else:
+                        logger.error(f"No file ids for post {post_id}, skipping")
+                        skipped += 1
+                        continue
+
+                    # Post to channel
+                    new_message = await self.post_to_channel(text_content, file_ids, post_id, context)
+                    if not new_message:
+                        logger.error(f"Failed to repost post {post_id} (date repost)")
+                        skipped += 1
+                        continue
+
+                    # Update DB with new message ids using async wrapper
+                    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    if isinstance(new_message, list):
+                        new_message_ids = [msg.message_id for msg in new_message]
+                        new_message_ids_json = json.dumps(new_message_ids)
+                        await async_db_execute('''
+                            UPDATE posts 
+                            SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                            WHERE id = ?
+                        ''', (new_message[0].message_id, new_message_ids_json, repost_count + 1, now_str, post_id))
+                    else:
+                        single_json = json.dumps([new_message.message_id])
+                        await async_db_execute('''
+                            UPDATE posts 
+                            SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                            WHERE id = ?
+                        ''', (new_message.message_id, single_json, repost_count + 1, now_str, post_id))
+
+                    processed += 1
+                    # After successful repost, originals were already deleted above
+                    logger.info(f"Successfully reposted post {post_id} (date repost)")
+
+                except Exception as e:
+                    logger.error(f"Error reposting post {post_id}: {e}", exc_info=True)
+                    skipped += 1
+
+            await update.message.reply_text(f"✅ Repost by date completed. Processed: {processed}, Skipped: {skipped}")
+
+        except Exception as e:
+            logger.error(f"/repost_now error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error executing date repost: {str(e)}")
         
     def run(self):
         """Start the bot"""
