@@ -31,6 +31,14 @@ Yoki qo'lda:
 pip install -r requirements.txt
 ```
 
+**Windows (PowerShell)**: run the helper script which creates a `.venv`, installs dependencies, copies `.env` from `env.example` (if missing) and initializes the DB:
+
+```powershell
+.\setup_env.ps1
+```
+
+See `SETUP_WINDOWS.md` for details.
+
 ### 3. .env faylini sozlash
 
 `.env` faylini tahrirlang (env.example-dan nusxa oling):
@@ -158,6 +166,20 @@ telegram-bot/
 ```
 
 ## 🛠 Rivojlantirish
+
+### Importing existing channel posts
+If you need to reset the database and import existing messages from your channel (e.g., after deleting `bookbot.db`):
+
+- Reset local DB: `python db_manager.py reset` (type `yes` to confirm)
+- Import channel messages: set `TELETHON_API_ID`, `TELETHON_API_HASH` and `CHANNEL_ID` in `.env`, then run:
+
+```bash
+pip install -r requirements.txt
+python import_channel.py
+```
+
+Note: Import uses a Telethon MTProto client to read channel history (the Bot API cannot read arbitrary historical messages).
+
 
 ### Xatoliklarni tekshirish
 ```bash

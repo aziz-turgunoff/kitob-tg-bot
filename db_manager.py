@@ -52,6 +52,22 @@ def cleanup_old_posts(days=30):
     
     print(f"✅ Deleted {deleted_count} posts older than {days} days")
 
+
+def reset_database():
+    """Drop and recreate database tables (WARNING: deletes all data)."""
+    confirm = input("Are you sure you want to reset the database? This will DELETE all data. Type 'yes' to continue: ")
+    if confirm.strip().lower() != 'yes':
+        print("Aborted database reset.")
+        return
+
+    # Drop tables if they exist
+    db.execute('DROP TABLE IF EXISTS posts')
+    db.execute('DROP TABLE IF EXISTS admins')
+
+    # Re-initialize schema
+    db.init_database()
+    print("✅ Database reset complete!")
+
 def show_stats():
     """Show database statistics"""
     # Total posts
@@ -114,6 +130,8 @@ def main():
                 print("❌ Invalid number of days")
                 return
         cleanup_old_posts(days)
+    elif command == "reset":
+        reset_database()
     else:
         print(f"❌ Unknown command: {command}")
 

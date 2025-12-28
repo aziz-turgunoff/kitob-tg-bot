@@ -11,18 +11,7 @@ import hashlib
 from dotenv import load_dotenv
 from database import db
 
-# Fix SQLite datetime deprecation warning for Python 3.12+
-def adapt_datetime_iso(val):
-    """Adapt datetime.datetime to ISO 8601 date."""
-    return val.isoformat()
 
-def convert_datetime(val):
-    """Convert ISO 8601 datetime to datetime.datetime object."""
-    return datetime.fromisoformat(val.decode())
-
-# Register the adapter and converter
-sqlite3.register_adapter(datetime, adapt_datetime_iso)
-sqlite3.register_converter("datetime", convert_datetime)
 
 def parse_db_datetime(dt_value):
     """Safely parse datetime from database (handles both string and datetime objects)"""
@@ -58,18 +47,15 @@ load_dotenv()
 # Async DB wrapper functions to avoid blocking the event loop
 async def async_db_execute(query: str, params: tuple = None):
     """Execute non-blocking DB write operation"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: db.execute(query, params))
+    return await asyncio.to_thread(db.execute, query, params)
 
 async def async_db_fetchone(query: str, params: tuple = None):
     """Fetch one DB result non-blocking"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: db.execute_fetchone(query, params))
+    return await asyncio.to_thread(db.execute_fetchone, query, params)
 
 async def async_db_fetchall(query: str, params: tuple = None):
     """Fetch all DB results non-blocking"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: db.execute_fetchall(query, params))
+    return await asyncio.to_thread(db.execute_fetchall, query, params)
 
 # Global file mapping for callback data
 file_mappings = {}
@@ -308,8 +294,8 @@ Narx
             if group_data.get('scheduled_job'):
                 try:
                     group_data['scheduled_job'].schedule_removal()
-                except:
-                    pass  # Job might already be removed
+                except Exception as e:
+                    logger.debug(f"Could not cancel scheduled job for media_group {media_group_id}: {e}")
             
             # Schedule new processing job after 1 second delay to ensure all photos are collected
             job = context.job_queue.run_once(
@@ -393,6 +379,12 @@ Narx
                     )
                     
                     await first_message.reply_text(result)
+
+                    # Clean up file_mappings for this file_id to avoid memory growth
+                    file_id_to_cleanup = processed_data.get('pending_file_id')
+                    keys_to_delete = [k for k, v in file_mappings.items() if v == file_id_to_cleanup]
+                    for k in keys_to_delete:
+                        del file_mappings[k]
                     
                     # Mark as processed to prevent duplicate posting
                     group_data['processed'] = True
@@ -497,6 +489,14 @@ Narx
                     )
                     
                     await update.message.reply_text(result)
+
+                    # Clean up file_mappings entries referencing this file_id to avoid memory growth
+                    try:
+                        keys_to_delete = [k for k, v in file_mappings.items() if v == file_id]
+                        for k in keys_to_delete:
+                            del file_mappings[k]
+                    except Exception:
+                        logger.debug("Error cleaning up file_mappings after single auto-post")
                 else:
                     await update.message.reply_text(
                         "❌ Kamida 8 qator matn kerak. Rasm bilan birga to'liq matnni yuboring va qaytadan urinib ko'ring."
@@ -517,9 +517,12 @@ Narx
         await query.answer()
         
         data = query.data
-        
-        # Sold button functionality removed
-            
+
+        # Validate callback payload format (expected: action_filehash)
+        if not isinstance(data, str) or '_' not in data:
+            await query.edit_message_text('❌ Invalid callback data.')
+            return
+
         action, file_hash = data.split('_', 1)
         
         # Get the actual file_id from the hash mapping
@@ -645,6 +648,14 @@ Narx
             )
             
             await query.edit_message_text(result)
+
+            # Clean up file_mappings entries that reference this file_id
+            try:
+                keys_to_delete = [k for k, v in file_mappings.items() if v == file_id]
+                for k in keys_to_delete:
+                    del file_mappings[k]
+            except Exception:
+                logger.debug("Error cleaning up file_mappings after confirm_and_post")
                 
         except Exception as e:
             logger.error(f"Confirm and post error: {e}")
@@ -680,7 +691,7 @@ Narx
                     caption=None  # Don't duplicate caption; message already has its content
                 )
                 logger.info(f"Copied message {message_id} to channel, new id: {copied_msg.message_id}")
-                return copied_msg.message_id
+                return copied_msg
             
             except RetryAfter as e:
                 # Telegram rate-limited us; respect the server's backoff
@@ -769,7 +780,21 @@ Narx
                     return messages
                 except BadRequest as e:
                     logger.error(f"send_media_group BadRequest: {e}", exc_info=True)
-                    return None
+                    # Fallback: send first photo with caption, then remaining photos without caption
+                    try:
+                        first_msg = await context.bot.send_photo(
+                            chat_id=self.channel_id,
+                            photo=file_ids[0],
+                            caption=formatted_text,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        if len(file_ids) > 1:
+                            others = [InputMediaPhoto(media=fid) for fid in file_ids[1:]]
+                            await context.bot.send_media_group(chat_id=self.channel_id, media=others)
+                        return first_msg
+                    except Exception as e2:
+                        logger.error(f"Fallback failed for media group: {e2}", exc_info=True)
+                        return None
                 except TelegramError as e:
                     logger.error(f"send_media_group TelegramError: {e}", exc_info=True)
                     return None
@@ -893,44 +918,91 @@ Narx
                     if not message_ids_to_delete and channel_message_id:
                         message_ids_to_delete = [channel_message_id]
                     
-                    # Delete ALL old messages from channel BEFORE posting new one
-                    # Track deletion results to determine if we should skip reposting
-                    messages_not_found_count = 0
-                    messages_deleted_count = 0
-                    messages_cant_delete_count = 0
-                    
+                    # If we don't have any recorded channel message ids, skip reposting
                     if not message_ids_to_delete:
-                        # If we don't have any recorded channel message ids, skip reposting
                         logger.info(f"Skipping repost for post {post_id} - no recorded channel message id(s)")
                         continue
 
-                    if message_ids_to_delete:
+                    # First, attempt to copy the original channel messages to create new ones (preferred; preserves original media and format)
+                    copy_failed = False
+                    copied_messages = []
+                    for msg_id in message_ids_to_delete:
+                        copied = await self.repost_with_copy_message(context, self.channel_id, msg_id, text_content)
+                        if copied is None:
+                            copy_failed = True
+                            logger.info(f"Could not copy original message {msg_id} for post {post_id} - falling back to re-upload")
+                            break
+                        copied_messages.append(copied)
+
+                    if not copy_failed and copied_messages:
+                        # After successful copying, attempt to delete original messages (best-effort)
                         for msg_id in message_ids_to_delete:
                             try:
                                 await context.bot.delete_message(chat_id=self.channel_id, message_id=msg_id)
-                                logger.info(f"Deleted old message {msg_id} for post {post_id}")
-                                messages_deleted_count += 1
+                                logger.info(f"Deleted old message {msg_id} for post {post_id} after copying")
                             except BadRequest as e:
-                                error_msg = str(e).lower()
-                                if "message to delete not found" in error_msg or "message not found" in error_msg:
-                                    # Message already deleted (manually removed from channel)
-                                    messages_not_found_count += 1
-                                    logger.info(f"Message {msg_id} for post {post_id} was already deleted")
-                                elif "message can't be deleted" in error_msg or "can't delete" in error_msg or "not enough rights" in error_msg:
-                                    # Forwarded message or permission issue - message exists but can't be deleted
-                                    messages_cant_delete_count += 1
-                                    logger.warning(f"Cannot delete message {msg_id} for post {post_id} - likely a forwarded message or insufficient permissions: {e}")
-                                    # Continue with repost anyway
+                                err = str(e).lower()
+                                if "message to delete not found" in err or "message not found" in err:
+                                    logger.info(f"Original message {msg_id} for post {post_id} already deleted after copying")
+                                elif "message can't be deleted" in err or "can't delete" in err or "not enough rights" in err:
+                                    logger.warning(f"Cannot delete original message {msg_id} for post {post_id} - insufficient permissions: {e}")
                                 else:
-                                    logger.warning(f"Could not delete message {msg_id} for post {post_id}: {e}")
+                                    logger.warning(f"Could not delete original message {msg_id} for post {post_id}: {e}")
                             except Exception as e:
-                                # Other errors - log but continue
-                                logger.warning(f"Could not delete message {msg_id} for post {post_id}: {e}")
+                                logger.warning(f"Could not delete original message {msg_id} for post {post_id}: {e}")
 
-                        # If any message was "not found" (manually deleted), skip reposting
-                        if messages_not_found_count > 0:
-                            logger.info(f"Skipping repost for post {post_id} - one or more messages were manually deleted from channel")
-                            continue
+                        # Update database with new copied message id(s)
+                        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        if len(copied_messages) > 1:
+                            new_message_ids = [m.message_id for m in copied_messages]
+                            new_message_ids_json = json.dumps(new_message_ids)
+                            await async_db_execute('''
+                                UPDATE posts 
+                                SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                                WHERE id = ?
+                            ''', (copied_messages[0].message_id, new_message_ids_json, repost_count + 1, now_str, post_id))
+                        else:
+                            single_json = json.dumps([copied_messages[0].message_id])
+                            await async_db_execute('''
+                                UPDATE posts 
+                                SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                                WHERE id = ?
+                            ''', (copied_messages[0].message_id, single_json, repost_count + 1, now_str, post_id))
+
+                        logger.info(f"Successfully reposted book post {post_id} by copying original messages")
+                        continue
+
+                    # If copying failed or was not possible, fall back to deleting old messages and re-uploading
+                    messages_not_found_count = 0
+                    messages_deleted_count = 0
+                    messages_cant_delete_count = 0
+
+                    for msg_id in message_ids_to_delete:
+                        try:
+                            await context.bot.delete_message(chat_id=self.channel_id, message_id=msg_id)
+                            logger.info(f"Deleted old message {msg_id} for post {post_id}")
+                            messages_deleted_count += 1
+                        except BadRequest as e:
+                            error_msg = str(e).lower()
+                            if "message to delete not found" in error_msg or "message not found" in error_msg:
+                                # Message already deleted (manually removed from channel)
+                                messages_not_found_count += 1
+                                logger.info(f"Message {msg_id} for post {post_id} was already deleted")
+                            elif "message can't be deleted" in error_msg or "can't delete" in error_msg or "not enough rights" in error_msg:
+                                # Forwarded message or permission issue - message exists but can't be deleted
+                                messages_cant_delete_count += 1
+                                logger.warning(f"Cannot delete message {msg_id} for post {post_id} - likely a forwarded message or insufficient permissions: {e}")
+                                # Continue with repost anyway
+                            else:
+                                logger.warning(f"Could not delete message {msg_id} for post {post_id}: {e}")
+                        except Exception as e:
+                            # Other errors - log but continue
+                            logger.warning(f"Could not delete message {msg_id} for post {post_id}: {e}")
+
+                    # If any message was "not found" (manually deleted), skip reposting
+                    if messages_not_found_count > 0:
+                        logger.info(f"Skipping repost for post {post_id} - one or more messages were manually deleted from channel")
+                        continue
                     
                     # Determine which data format to use (backward compatibility)
                     new_message = None
@@ -1144,7 +1216,55 @@ Narx
                         skipped += 1
                         continue
 
-                    # Try to delete old messages first; if any are not found => skip repost
+                    # First, attempt to copy the original messages
+                    copy_failed = False
+                    copied_messages = []
+                    for msg_id in message_ids_to_delete:
+                        copied = await self.repost_with_copy_message(context, self.channel_id, msg_id, text_content)
+                        if copied is None:
+                            copy_failed = True
+                            logger.info(f"Could not copy original message {msg_id} for post {post_id} (date repost) - falling back to re-upload")
+                            break
+                        copied_messages.append(copied)
+
+                    if not copy_failed and copied_messages:
+                        # Attempt to delete originals (best-effort)
+                        for msg_id in message_ids_to_delete:
+                            try:
+                                await context.bot.delete_message(chat_id=self.channel_id, message_id=msg_id)
+                                logger.info(f"Deleted old message {msg_id} for post {post_id} after copying (date repost)")
+                            except BadRequest as e:
+                                err = str(e).lower()
+                                if "message to delete not found" in err or "message not found" in err:
+                                    logger.info(f"Original message {msg_id} for post {post_id} already deleted (date repost)")
+                                else:
+                                    logger.warning(f"Could not delete original message {msg_id} for post {post_id} (date repost): {e}")
+                            except Exception as e:
+                                logger.warning(f"Could not delete original message {msg_id} for post {post_id} (date repost): {e}")
+
+                        # Update DB with new copied message ids
+                        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        if len(copied_messages) > 1:
+                            new_message_ids = [m.message_id for m in copied_messages]
+                            new_message_ids_json = json.dumps(new_message_ids)
+                            await async_db_execute('''
+                                UPDATE posts 
+                                SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                                WHERE id = ?
+                            ''', (copied_messages[0].message_id, new_message_ids_json, repost_count + 1, now_str, post_id))
+                        else:
+                            single_json = json.dumps([copied_messages[0].message_id])
+                            await async_db_execute('''
+                                UPDATE posts 
+                                SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                                WHERE id = ?
+                            ''', (copied_messages[0].message_id, single_json, repost_count + 1, now_str, post_id))
+
+                        processed += 1
+                        logger.info(f"Successfully reposted post {post_id} by copying original messages (date repost)")
+                        continue
+
+                    # Fallback: try delete old messages first; if any are not found => skip repost
                     any_not_found = False
                     for msg_id in message_ids_to_delete:
                         try:

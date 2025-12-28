@@ -29,7 +29,22 @@ def adapt_datetime_iso(val):
 
 def convert_datetime(val):
     """Convert ISO 8601 datetime to datetime.datetime object."""
-    return datetime.fromisoformat(val.decode())
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, (bytes, bytearray)):
+        s = val.decode()
+    else:
+        s = val
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        try:
+            return datetime.strptime(s, '%Y-%m-%d %H:%M:%S')
+        except Exception:
+            logger.warning(f"Could not convert datetime: {val}")
+            return None
 
 # Register the adapter and converter
 sqlite3.register_adapter(datetime, adapt_datetime_iso)
@@ -185,33 +200,37 @@ class Database:
         
         # Replace INSERT OR REPLACE with INSERT ... ON CONFLICT
         if 'INSERT OR REPLACE INTO' in query.upper():
-            # Extract table name and values
-            query_upper = query.upper()
-            table_start = query_upper.find('INSERT OR REPLACE INTO') + len('INSERT OR REPLACE INTO')
-            table_end = query_upper.find('(', table_start)
-            table_name = query[table_start:table_end].strip()
-            
-            # Find the column list
-            col_start = query.find('(', table_end)
-            col_end = query.find(')', col_start)
-            columns = query[col_start+1:col_end]
-            
-            # Find VALUES
-            values_start = query_upper.find('VALUES', col_end)
-            values_end = query.find(')', values_start + 6)
-            values = query[values_start + 6:values_end + 1]
-            
-            # Extract primary key column (first column in INSERT OR REPLACE)
-            first_col = columns.split(',')[0].strip()
-            
-            # Reconstruct as INSERT ... ON CONFLICT
-            new_query = f"INSERT INTO {table_name} ({columns}) {values} ON CONFLICT ({first_col}) DO UPDATE SET "
-            # Update all columns except the primary key
-            cols = [c.strip() for c in columns.split(',')]
-            updates = [f"{col} = EXCLUDED.{col}" for col in cols[1:]]  # Skip first (primary key)
-            new_query += ", ".join(updates)
-            
-            return new_query
+            try:
+                # Extract table name and values
+                query_upper = query.upper()
+                table_start = query_upper.find('INSERT OR REPLACE INTO') + len('INSERT OR REPLACE INTO')
+                table_end = query_upper.find('(', table_start)
+                table_name = query[table_start:table_end].strip()
+
+                # Find the column list
+                col_start = query.find('(', table_end)
+                col_end = query.find(')', col_start)
+                columns = query[col_start+1:col_end]
+
+                # Find VALUES
+                values_start = query_upper.find('VALUES', col_end)
+                values_end = query.find(')', values_start + 6)
+                values = query[values_start + 6:values_end + 1]
+
+                # Extract primary key column (first column in INSERT OR REPLACE)
+                first_col = columns.split(',')[0].strip()
+
+                # Reconstruct as INSERT ... ON CONFLICT
+                new_query = f"INSERT INTO {table_name} ({columns}) {values} ON CONFLICT ({first_col}) DO UPDATE SET "
+                # Update all columns except the primary key
+                cols = [c.strip() for c in columns.split(',')]
+                updates = [f"{col} = EXCLUDED.{col}" for col in cols[1:]]  # Skip first (primary key)
+                new_query += ", ".join(updates)
+
+                return new_query
+            except Exception as e:
+                logger.warning(f"Could not convert INSERT OR REPLACE query to PostgreSQL ON CONFLICT form: {e}")
+                return query
         
         # Replace julianday() with PostgreSQL date comparison
         if 'julianday' in query.lower():
