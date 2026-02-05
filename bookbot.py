@@ -678,7 +678,7 @@ Narx
     async def repost_with_copy_message(self, context: ContextTypes.DEFAULT_TYPE, from_chat_id: int, 
                                        message_id: int, text_content: str, max_retries: int = 3) -> Optional[int]:
         """Copy a message from channel to channel with exponential backoff for rate-limiting.
-        Returns: new message_id on success, None on failure"""
+        Returns: new message object on success, None on failure"""
         backoff = 1  # Start with 1 second
         
         for attempt in range(max_retries):
@@ -691,7 +691,7 @@ Narx
                     caption=None  # Don't duplicate caption; message already has its content
                 )
                 logger.info(f"Copied message {message_id} to channel, new id: {copied_msg.message_id}")
-                return copied_msg
+                return copied_msg  # Return the full message object, not just ID
             
             except RetryAfter as e:
                 # Telegram rate-limited us; respect the server's backoff
@@ -936,6 +936,7 @@ Narx
 
                     if not copy_failed and copied_messages:
                         # After successful copying, attempt to delete original messages (best-effort)
+                        deletion_successful = True
                         for msg_id in message_ids_to_delete:
                             try:
                                 await context.bot.delete_message(chat_id=self.channel_id, message_id=msg_id)
@@ -946,30 +947,37 @@ Narx
                                     logger.info(f"Original message {msg_id} for post {post_id} already deleted after copying")
                                 elif "message can't be deleted" in err or "can't delete" in err or "not enough rights" in err:
                                     logger.warning(f"Cannot delete original message {msg_id} for post {post_id} - insufficient permissions: {e}")
+                                    deletion_successful = False
                                 else:
                                     logger.warning(f"Could not delete original message {msg_id} for post {post_id}: {e}")
+                                    deletion_successful = False
                             except Exception as e:
                                 logger.warning(f"Could not delete original message {msg_id} for post {post_id}: {e}")
+                                deletion_successful = False
 
-                        # Update database with new copied message id(s)
-                        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        if len(copied_messages) > 1:
-                            new_message_ids = [m.message_id for m in copied_messages]
-                            new_message_ids_json = json.dumps(new_message_ids)
-                            await async_db_execute('''
-                                UPDATE posts 
-                                SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
-                                WHERE id = ?
-                            ''', (copied_messages[0].message_id, new_message_ids_json, repost_count + 1, now_str, post_id))
+                        # Only update database if deletion was successful
+                        if deletion_successful:
+                            # Update database with new copied message id(s)
+                            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            if len(copied_messages) > 1:
+                                new_message_ids = [m.message_id for m in copied_messages]
+                                new_message_ids_json = json.dumps(new_message_ids)
+                                await async_db_execute('''
+                                    UPDATE posts 
+                                    SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                                    WHERE id = ?
+                                ''', (copied_messages[0].message_id, new_message_ids_json, repost_count + 1, now_str, post_id))
+                            else:
+                                single_json = json.dumps([copied_messages[0].message_id])
+                                await async_db_execute('''
+                                    UPDATE posts 
+                                    SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
+                                    WHERE id = ?
+                                ''', (copied_messages[0].message_id, single_json, repost_count + 1, now_str, post_id))
+
+                            logger.info(f"Successfully reposted book post {post_id} by copying original messages")
                         else:
-                            single_json = json.dumps([copied_messages[0].message_id])
-                            await async_db_execute('''
-                                UPDATE posts 
-                                SET channel_message_id = ?, channel_message_ids = ?, repost_count = ?, last_repost = ?
-                                WHERE id = ?
-                            ''', (copied_messages[0].message_id, single_json, repost_count + 1, now_str, post_id))
-
-                        logger.info(f"Successfully reposted book post {post_id} by copying original messages")
+                            logger.warning(f"Deletion of original messages failed for post {post_id} - not updating database to preserve original message references")
                         continue
 
                     # If copying failed or was not possible, fall back to deleting old messages and re-uploading
