@@ -77,20 +77,9 @@ def show_stats():
     # Active posts (all posts are now active)
     active_posts = total_posts
     
-    # Posts needing repost
-    week_ago = datetime.now() - timedelta(days=7)
-    week_ago_str = week_ago.strftime('%Y-%m-%d %H:%M:%S')
-    result = db.execute_fetchone('''
-        SELECT COUNT(*) FROM posts 
-        WHERE julianday(created_at) <= julianday(?) 
-        AND (last_repost IS NULL OR julianday(last_repost) <= julianday(?))
-    ''', (week_ago_str, week_ago_str))
-    repost_needed = result[0] if result else 0
-    
     print("Database Statistics:")
     print(f"Total posts: {total_posts}")
-    print(f"Active posts: {active_posts}")
-    print(f"Posts needing repost: {repost_needed}")
+    print(f"Total admins: {db.execute_fetchone('SELECT COUNT(*) FROM admins')[0]}")
 
 def main():
     """Main function"""

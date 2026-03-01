@@ -264,37 +264,30 @@ class Database:
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS posts (
                         id SERIAL PRIMARY KEY,
-                        user_id INTEGER,
-                        message_id INTEGER,
-                        channel_message_id INTEGER,
+                        user_id BIGINT,
+                        message_id BIGINT,
+                        channel_message_id BIGINT,
                         channel_message_ids TEXT,
                         text_content TEXT,
-                        image_path TEXT,
                         file_ids TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        repost_count INTEGER DEFAULT 0,
-                        last_repost TIMESTAMP
+                        status TEXT DEFAULT 'POSTED',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
-                ''')
-                
-                # Add channel_message_ids column if it doesn't exist
-                cursor.execute('''
-                    DO $$ 
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns 
-                            WHERE table_name='posts' AND column_name='channel_message_ids'
-                        ) THEN
-                            ALTER TABLE posts ADD COLUMN channel_message_ids TEXT;
-                        END IF;
-                    END $$;
                 ''')
                 
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS admins (
-                        user_id INTEGER PRIMARY KEY,
+                        user_id BIGINT PRIMARY KEY,
                         username TEXT,
                         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS callback_mappings (
+                        callback_hash TEXT PRIMARY KEY,
+                        file_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
             else:
@@ -304,30 +297,30 @@ class Database:
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS posts (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER,
-                        message_id INTEGER,
-                        channel_message_id INTEGER,
+                        user_id BIGINT,
+                        message_id BIGINT,
+                        channel_message_id BIGINT,
                         channel_message_ids TEXT,
                         text_content TEXT,
-                        image_path TEXT,
                         file_ids TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        repost_count INTEGER DEFAULT 0,
-                        last_repost TIMESTAMP
+                        status TEXT DEFAULT 'POSTED',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
                 
-                # Add channel_message_ids column if it doesn't exist
-                try:
-                    cursor.execute('ALTER TABLE posts ADD COLUMN channel_message_ids TEXT')
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-                
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS admins (
-                        user_id INTEGER PRIMARY KEY,
+                        user_id BIGINT PRIMARY KEY,
                         username TEXT,
                         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS callback_mappings (
+                        callback_hash TEXT PRIMARY KEY,
+                        file_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
             
