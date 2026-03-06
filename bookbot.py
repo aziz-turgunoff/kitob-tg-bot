@@ -706,17 +706,17 @@ Narx
             if len(lines) < 8:
                 return None
                 
-            # Format the post with premium layout
+            # Format the post with the updated style
             formatted_text = (
-                f"**#kitob\n"
-                f"📖 **Nomi:** {lines[0]}\n"
+                f"#kitob\n"
+                f"📓 **Nomi:** {lines[0]}\n"
                 f"✍️ **Muallifi:** {lines[1]}\n"
-                f"📄 **Sahifalar:** {lines[2]}\n"
-                f"✨ **Holati:** {lines[3]}\n"
-                f"🎨 **Muqovasi:** {lines[4]}\n"
-                f"📅 **Yil:** {lines[5]}\n"
-                f"ℹ️ **Tavsif:** {lines[6]}\n\n"
-                f"👤 **Murojaat:** {CONTACT_USERNAME}\n"
+                f"📖 **Beti:** {lines[2]}\n"
+                f"🕵️‍♂️ **Holati:** {lines[3]}\n"
+                f"📚 **Muqovasi:** {lines[4]}\n"
+                f"📅 **Nashr etilgan yili:** {lines[5]}\n"
+                f"📝 **Qo'shimcha ma'lumot:** {lines[6]}\n"
+                f"👤 **Murojaat uchun:** {CONTACT_USERNAME}\n"
                 f"💰 **Narxi:** `{lines[7]}`"
             )
             
