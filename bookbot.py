@@ -708,8 +708,7 @@ Narx
                 
             # Format the post with premium layout
             formatted_text = (
-                f"📚 **YANGI KITOB SOTUVDA** 📚\n"
-                f"───────────────────\n"
+                f"**#kitob\n"
                 f"📖 **Nomi:** {lines[0]}\n"
                 f"✍️ **Muallifi:** {lines[1]}\n"
                 f"📄 **Sahifalar:** {lines[2]}\n"
@@ -718,8 +717,7 @@ Narx
                 f"📅 **Yil:** {lines[5]}\n"
                 f"ℹ️ **Tavsif:** {lines[6]}\n\n"
                 f"👤 **Murojaat:** {CONTACT_USERNAME}\n"
-                f"💰 **Narxi:** `{lines[7]}`\n\n"
-                f"#kitob #sotuvda"
+                f"💰 **Narxi:** `{lines[7]}`"
             )
             
             # Send multiple photos as media group
